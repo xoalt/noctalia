@@ -2143,6 +2143,12 @@ namespace noctalia::config::schema {
           field(&BarCapsuleGroupStyle::opacity, "opacity", kBarOpacityRange),
           field(&BarCapsuleGroupStyle::accordion, "accordion"),
           enumField(&BarCapsuleGroupStyle::accordionDirection, "accordion_direction", kBarAccordionDirections),
+          optionalIntField(
+              &BarCapsuleGroupStyle::accordionDurationMs, "accordion_duration", Range<std::int64_t>{0, 2000}
+          ),
+          optionalIntField(
+              &BarCapsuleGroupStyle::accordionDelayMs, "accordion_delay", Range<std::int64_t>{0, 2000}
+          ),
           optionalIntField(&BarCapsuleGroupStyle::widgetSpacing, "widget_spacing"),
       };
       return s;

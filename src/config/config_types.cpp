@@ -429,7 +429,60 @@ namespace {
   effectiveLane(const std::optional<std::vector<std::string>>& monitorLane, const std::vector<std::string>& barLane) {
     return monitorLane.has_value() ? *monitorLane : barLane;
   }
+
+  const BarCapsuleGroupStyle* findGroupIn(const std::vector<BarCapsuleGroupStyle>& groups, std::string_view id) {
+    for (const auto& group : groups) {
+      if (group.id == id) {
+        return &group;
+      }
+    }
+    return nullptr;
+  }
 } // namespace
+
+bool capsuleGroupHasNestedRef(const BarCapsuleGroupStyle& group) {
+  for (const auto& member : group.members) {
+    if (isCapsuleGroupToken(member)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<std::string> nestedCapsuleGroupIds(const BarCapsuleGroupStyle& group) {
+  std::vector<std::string> out;
+  for (const auto& member : group.members) {
+    if (!isCapsuleGroupToken(member)) {
+      continue;
+    }
+    std::string id = capsuleGroupTokenId(member);
+    if (!id.empty() && !std::ranges::contains(out, id)) {
+      out.push_back(std::move(id));
+    }
+  }
+  return out;
+}
+
+std::set<std::string> transitiveCapsuleGroupRefs(
+    const std::set<std::string>& referenced, const std::vector<BarCapsuleGroupStyle>& groups
+) {
+  std::set<std::string> out = referenced;
+  std::vector<std::string> queue(out.begin(), out.end());
+  while (!queue.empty()) {
+    std::string id = std::move(queue.back());
+    queue.pop_back();
+    const BarCapsuleGroupStyle* group = findGroupIn(groups, id);
+    if (group == nullptr) {
+      continue;
+    }
+    for (const auto& nested : nestedCapsuleGroupIds(*group)) {
+      if (out.insert(nested).second) {
+        queue.push_back(nested);
+      }
+    }
+  }
+  return out;
+}
 
 std::set<std::string> capsuleGroupRefsForBarScope(const BarConfig& bar) {
   std::set<std::string> refs;
@@ -444,7 +497,9 @@ std::set<std::string> capsuleGroupRefsForBarScope(const BarConfig& bar) {
     collectCapsuleGroupRefs(effectiveLane(ovr.centerWidgets, bar.centerWidgets), refs);
     collectCapsuleGroupRefs(effectiveLane(ovr.endWidgets, bar.endWidgets), refs);
   }
-  return refs;
+  // Keep groups reachable only through nesting (a lane token's members referencing
+  // further groups); otherwise the next override reconcile would drop them.
+  return transitiveCapsuleGroupRefs(refs, bar.widgetCapsuleGroups);
 }
 
 std::set<std::string> capsuleGroupRefsForMonitorScope(const BarConfig& bar, const BarMonitorOverride& monitorOverride) {
@@ -452,7 +507,9 @@ std::set<std::string> capsuleGroupRefsForMonitorScope(const BarConfig& bar, cons
   collectCapsuleGroupRefs(effectiveLane(monitorOverride.startWidgets, bar.startWidgets), refs);
   collectCapsuleGroupRefs(effectiveLane(monitorOverride.centerWidgets, bar.centerWidgets), refs);
   collectCapsuleGroupRefs(effectiveLane(monitorOverride.endWidgets, bar.endWidgets), refs);
-  return refs;
+  const std::vector<BarCapsuleGroupStyle>& groups =
+      monitorOverride.widgetCapsuleGroups.has_value() ? *monitorOverride.widgetCapsuleGroups : bar.widgetCapsuleGroups;
+  return transitiveCapsuleGroupRefs(refs, groups);
 }
 
 std::vector<BarCapsuleGroupStyle> reconcileCapsuleGroups(
@@ -504,6 +561,12 @@ WidgetBarCapsuleSpec capsuleSpecFromGroup(const BarConfig& bar, const BarCapsule
   spec.opacity = group.opacity;
   spec.accordion = group.accordion;
   spec.accordionDirection = group.accordionDirection;
+  spec.accordionDurationMs = group.accordionDurationMs.has_value()
+      ? std::optional<float>{std::clamp(static_cast<float>(*group.accordionDurationMs), 0.0F, 2000.0F)}
+      : std::nullopt;
+  spec.accordionDelayMs = group.accordionDelayMs.has_value()
+      ? std::optional<float>{std::clamp(static_cast<float>(*group.accordionDelayMs), 0.0F, 2000.0F)}
+      : std::nullopt;
   spec.widgetSpacing =
       group.widgetSpacing.has_value() ? std::optional<float>{static_cast<float>(*group.widgetSpacing)} : std::nullopt;
   spec.hoverHighlight = bar.hoverHighlight;

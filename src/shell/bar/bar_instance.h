@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/config_service.h"
+#include "core/timer_manager.h"
 #include "render/animation/animation_manager.h"
 #include "render/scene/input_area.h"
 #include "render/scene/input_dispatcher.h"
@@ -29,10 +30,30 @@ struct BarCapsuleRun {
   float contentScale = 1.0F;
   // Capsule geometry can exist without a painted fill or border.
   bool hasPaintedCapsuleBackground = false;
+  // Direct member widgets of this run (for nested runs: only the widgets owned directly by
+  // this group; nested groups live in `children`).
   std::vector<Widget*> widgets;
+  // Nested inner-group runs, rendered with their shells as flex items inside this run's
+  // container (visual group-in-group nesting, one level deep). Empty for flat runs.
+  std::vector<BarCapsuleRun> children;
+  // Interleaving of direct widgets and nested children in container order. Entries with
+  // `isChild == false` index into `widgets`; entries with `isChild == true` index into
+  // `children`. Empty for flat runs (container order then equals `widgets` order).
+  struct MemberRef {
+    bool isChild = false;
+    std::size_t index = 0;
+  };
+  std::vector<MemberRef> memberOrder;
   // Hover highlight overlays, parallel to `widgets` for group runs; one shared box for single runs.
   std::vector<Box*> hoverBoxes;
   bool accordion = false;
+  // Unfold animation time in milliseconds. Matches Style::animNormal; always overwritten from the
+  // group's accordion_duration setting when the run is built.
+  float accordionDurationMs = 200.0F;
+  // Hover time in milliseconds before unfolding starts (expand only; collapse is immediate).
+  float accordionDelayMs = 0.0F;
+  // Pending delayed expand; cancelled when the pointer leaves, the state resolves, or the run dies.
+  Timer accordionDelayTimer;
   // Clips accordion members to the reveal window (inside the capsule padding).
   Node* accordionClip = nullptr;
   BarAccordionDirection accordionDirection = BarAccordionDirection::End;
