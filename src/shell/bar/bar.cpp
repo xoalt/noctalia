@@ -13,6 +13,7 @@
 #include "ipc/ipc_service.h"
 #include "render/render_context.h"
 #include "render/scene/input_area.h"
+#include "shell/bar/bar_accordion_geometry.h"
 #include "shell/bar/bar_corner_shape.h"
 #include "shell/bar/bar_reserved_zone.h"
 #include "shell/bar/widget.h"
@@ -489,6 +490,7 @@ namespace {
     float y = 0.0F;
     float width = 0.0F;
     float height = 0.0F;
+    float contentScale = 1.0F;
     float sliceStart = 0.0F;
     float sliceEnd = 0.0F;
 
@@ -500,30 +502,14 @@ namespace {
 
   // Widget index sentinel marking a nested child capsule shell inside slices: a barrier that
   // clamps neighboring widgets' hover/hit tiling so they never extend across the inner capsule.
-  static constexpr std::size_t kNestedChildBarrier = static_cast<std::size_t>(-1);
+  constexpr std::size_t kNestedChildBarrier = static_cast<std::size_t>(-1);
 
   // Visits every run in `tops` depth-first, children before their parent (post-order), so nested
   // inner capsules are finalized before the outer capsule measures them.
-  template <typename Fn>
-  void forEachCapsuleRunPostOrder(std::vector<BarCapsuleRun>& tops, Fn&& fn) {
-    std::vector<std::pair<BarCapsuleRun*, bool>> stack;
+  template <typename Fn> void forEachCapsuleRunPostOrder(std::vector<BarCapsuleRun>& tops, Fn&& fn) {
     for (auto& run : tops) {
-      stack.emplace_back(&run, false);
-    }
-    while (!stack.empty()) {
-      auto [run, expanded] = stack.back();
-      stack.pop_back();
-      if (run == nullptr) {
-        continue;
-      }
-      if (!expanded) {
-        stack.emplace_back(run, true);
-        for (auto& child : run->children) {
-          stack.emplace_back(&child, false);
-        }
-        continue;
-      }
-      fn(*run);
+      forEachCapsuleRunPostOrder(run.children, fn);
+      fn(run);
     }
   }
 
@@ -552,16 +538,16 @@ namespace {
               .y = nodeY - shellY,
               .width = node->width(),
               .height = node->height(),
+              .contentScale = scale,
           }
       );
-      // Stash the member's content scale in sliceStart temporarily; replaced below. Avoids a
-      // second lookup for the nested-barrier entries that have no widget.
-      members.back().sliceStart = scale;
     };
     if (run.memberOrder.empty()) {
       for (std::size_t i = 0; i < run.widgets.size(); ++i) {
         Widget* widget = run.widgets[i];
-        pushNode(i, widget != nullptr ? widget->outerNode() : nullptr, widget != nullptr ? widget->contentScale() : 1.0F);
+        pushNode(
+            i, widget != nullptr ? widget->outerNode() : nullptr, widget != nullptr ? widget->contentScale() : 1.0F
+        );
       }
     } else {
       for (const auto& ref : run.memberOrder) {
@@ -583,7 +569,7 @@ namespace {
       auto& member = members[i];
       const float memberStart = member.mainStart(isVertical);
       const float memberEnd = member.mainEnd(isVertical);
-      const float pad = widgetHoverPadding * member.sliceStart;
+      const float pad = widgetHoverPadding * member.contentScale;
       float before = pad;
       float after = pad;
 
@@ -1041,182 +1027,184 @@ namespace {
     layoutWidgets(instance.centerWidgets);
     layoutWidgets(instance.endWidgets);
 
-    auto finalizeOneRun = [isVertical, capsuleCross, widgetHoverPadding = instance.barConfig.widgetCapsulePadding,
-                           &renderer](BarCapsuleRun& run) {
-        Node* shell = run.shell;
-        Box* bg = run.bg;
-        Node* content = run.content;
-        if (shell == nullptr || bg == nullptr || content == nullptr) {
-          return;
-        }
-        if (run.container != nullptr) {
-          run.container->layout(renderer);
-        }
+    auto finalizeOneRun = [isVertical, widgetHoverPadding = instance.barConfig.widgetCapsulePadding,
+                           &renderer](BarCapsuleRun& run, float crossSize) {
+      Node* shell = run.shell;
+      Box* bg = run.bg;
+      Node* content = run.content;
+      if (shell == nullptr || bg == nullptr || content == nullptr) {
+        return;
+      }
+      if (run.container != nullptr) {
+        run.container->layout(renderer);
+      }
 
-        bool hasVisibleContent = false;
-        bool hasCapsuleContent = false;
+      bool hasVisibleContent = false;
+      bool hasCapsuleContent = false;
+      for (Widget* widget : run.widgets) {
+        if (widget == nullptr || widget->root() == nullptr) {
+          continue;
+        }
+        hasVisibleContent = hasVisibleContent || widget->root()->visible();
+        hasCapsuleContent = hasCapsuleContent || widget->shouldShowBarCapsule();
+      }
+      // Nested inner capsules contribute their visibility (children are finalized first in
+      // post-order, so their flags are current). An outer capsule with only a nested child and
+      // no direct widgets still shows when the child shows.
+      for (const auto& child : run.children) {
+        if (child.shell != nullptr && child.shell->visible()) {
+          hasVisibleContent = true;
+        }
+        hasCapsuleContent = hasCapsuleContent || child.hasPaintedCapsuleBackground;
+      }
+      const bool hasPaintedFill = resolveColorSpec(scaleAlpha(run.spec.fill, run.spec.opacity)).a > 0.0F;
+      const bool hasPaintedBorder =
+          run.spec.border.has_value() && run.spec.borderWidth > 0.0F && resolveColorSpec(*run.spec.border).a > 0.0F;
+      run.hasPaintedCapsuleBackground = hasCapsuleContent && (hasPaintedFill || hasPaintedBorder);
+
+      shell->setVisible(hasVisibleContent);
+      // An invisible outer capsule hides its nested inner capsules with it, so hidden subtrees
+      // never capture hits while the outer group reports no visible ink.
+      if (!hasVisibleContent) {
+        for (auto& child : run.children) {
+          if (child.shell != nullptr) {
+            child.shell->setVisible(false);
+          }
+        }
+      }
+      const float scale = run.contentScale;
+      const float iw = content->width();
+      const float ih = content->height();
+      auto memberMainPos = [isVertical](const Node* node) { return isVertical ? node->y() : node->x(); };
+      auto memberMainExtent = [isVertical](const Node* node) { return isVertical ? node->height() : node->width(); };
+      auto clearAccordionSuppression = [&run]() {
         for (Widget* widget : run.widgets) {
-          if (widget == nullptr || widget->root() == nullptr) {
-            continue;
+          if (widget != nullptr) {
+            widget->setBarPointerSuppressed(false);
           }
-          hasVisibleContent = hasVisibleContent || widget->root()->visible();
-          hasCapsuleContent = hasCapsuleContent || widget->shouldShowBarCapsule();
         }
-        // Nested inner capsules contribute their visibility (children are finalized first in
-        // post-order, so their flags are current). An outer capsule with only a nested child and
-        // no direct widgets still shows when the child shows.
-        for (const auto& child : run.children) {
-          if (child.shell != nullptr && child.shell->visible()) {
-            hasVisibleContent = true;
-          }
-          hasCapsuleContent = hasCapsuleContent || child.hasPaintedCapsuleBackground;
+      };
+      if (!hasCapsuleContent) {
+        shell->setSize(iw, ih);
+        if (run.accordionClip != nullptr) {
+          run.accordionClip->setPosition(0.0F, 0.0F);
+          run.accordionClip->setSize(iw, ih);
         }
-        const bool hasPaintedFill = resolveColorSpec(scaleAlpha(run.spec.fill, run.spec.opacity)).a > 0.0F;
-        const bool hasPaintedBorder =
-            run.spec.border.has_value() && run.spec.borderWidth > 0.0F && resolveColorSpec(*run.spec.border).a > 0.0F;
-        run.hasPaintedCapsuleBackground = hasCapsuleContent && (hasPaintedFill || hasPaintedBorder);
-
-        shell->setVisible(hasVisibleContent);
-        // An invisible outer capsule hides its nested inner capsules with it, so hidden subtrees
-        // never capture hits while the outer group reports no visible ink.
-        if (!hasVisibleContent) {
-          for (auto& child : run.children) {
-            if (child.shell != nullptr) {
-              child.shell->setVisible(false);
+        content->setPosition(0.0F, 0.0F);
+        bg->setVisible(false);
+        bg->setPosition(0.0F, 0.0F);
+        bg->setSize(iw, ih);
+        placeCapsuleHoverBoxes(run, isVertical, iw, ih, 0.0F, 0.0F, std::min(iw, ih) * 0.5F, widgetHoverPadding);
+        // No pill to hover: the group renders full-size, so nothing may stay input-suppressed.
+        if (run.accordion) {
+          clearAccordionSuppression();
+        }
+        return;
+      }
+      const float pad = run.spec.padding * scale;
+      const float padMain = pad;
+      const float fullMain = isVertical ? ih : iw;
+      // Collapsed accordion: the shell only spans its always-visible member; the rest are clipped
+      // out and revealed as the hover progress lerps the main extent up to the full content size.
+      const bool accordionStartDir = run.accordion && run.accordionDirection == BarAccordionDirection::Start;
+      float revealMain = fullMain;
+      if (run.accordion) {
+        const Node* visibleMember = nullptr;
+        auto laidOut = [](const Widget* widget) {
+          const Node* node = widget != nullptr ? widget->outerNode() : nullptr;
+          return node != nullptr && node->visible() && node->participatesInLayout() ? node : nullptr;
+        };
+        if (run.accordionVisibleIndex < run.widgets.size()) {
+          visibleMember = laidOut(run.widgets[run.accordionVisibleIndex]);
+        }
+        if (visibleMember == nullptr) {
+          // The configured first member is hidden: anchor on the laid-out member at the pill's fixed edge.
+          for (Widget* widget : run.widgets) {
+            if (const Node* node = laidOut(widget); node != nullptr) {
+              visibleMember = node;
+              if (!accordionStartDir) {
+                break;
+              }
             }
           }
         }
-        const float scale = run.contentScale;
-        const float iw = content->width();
-        const float ih = content->height();
-        auto memberMainPos = [isVertical](const Node* node) { return isVertical ? node->y() : node->x(); };
-        auto memberMainExtent = [isVertical](const Node* node) { return isVertical ? node->height() : node->width(); };
-        auto clearAccordionSuppression = [&run]() {
-          for (Widget* widget : run.widgets) {
+        if (visibleMember != nullptr) {
+          const float visMain = memberMainExtent(visibleMember);
+          revealMain = barAccordionRevealExtent(visMain, fullMain, run.accordionProgress);
+        }
+      }
+      // Each run has a fixed cross-size; nested runs use the inset size.
+      // Member scaling changes content inside the capsule, while padding sets its main extent.
+      const float shellMain = revealMain + 2.0F * padMain;
+      const float shellCross = crossSize;
+      const float shellW = isVertical ? shellCross : shellMain;
+      const float shellH = isVertical ? shellMain : shellCross;
+      // Start-direction accordions pin the content's end edge, so the always-visible last member
+      // stays put while the hidden ones unfold off the pill's leading edge.
+      const float contentMain = accordionStartDir ? shellMain - padMain - fullMain : padMain;
+      const float contentX = isVertical ? (shellW - iw) * 0.5F : contentMain;
+      const float contentY = isVertical ? contentMain : (shellH - ih) * 0.5F;
+      shell->setSize(shellW, shellH);
+      bg->setVisible(true);
+      bg->setPosition(0.0F, 0.0F);
+      bg->setSize(shellW, shellH);
+      if (run.accordionClip != nullptr) {
+        // Reveal window: [padMain, padMain + revealMain] in shell coordinates, for both directions.
+        if (isVertical) {
+          run.accordionClip->setPosition(0.0F, padMain);
+          run.accordionClip->setSize(shellCross, revealMain);
+        } else {
+          run.accordionClip->setPosition(padMain, 0.0F);
+          run.accordionClip->setSize(revealMain, shellCross);
+        }
+        content->setPosition(contentX - (isVertical ? 0.0F : padMain), contentY - (isVertical ? padMain : 0.0F));
+      } else {
+        content->setPosition(contentX, contentY);
+      }
+      const Widget* radiusSource = !run.widgets.empty() ? run.widgets.front() : nullptr;
+      const float maxRadius = std::max(0.0F, std::min(shellW, shellH) * 0.5F);
+      const float capsuleRadius = radiusSource != nullptr ? radiusSource->resolvedBarCapsuleRadius(shellW, shellH)
+          : run.spec.radius.has_value()                   ? std::clamp(*run.spec.radius * scale, 0.0F, maxRadius)
+                                                          : maxRadius;
+      bg->setRadius(capsuleRadius);
+      if (run.container == nullptr) {
+        placeCapsuleHoverBoxes(run, isVertical, shellW, shellH, contentX, contentY, capsuleRadius, widgetHoverPadding);
+      }
+      // Members outside the reveal window are clipped out; while collapsed (or collapsing) the
+      // non-primary members are pointer-suppressed by reveal window so their hidden slots don't
+      // capture clicks. While expanded, every valid layout member stays unsuppressed so hover
+      // tracking and member interactions remain active across the reveal animation.
+      if (run.accordion) {
+        for (Widget* widget : run.widgets) {
+          const Node* node = widget != nullptr ? widget->outerNode() : nullptr;
+          if (widget == nullptr || node == nullptr || !node->visible() || !node->participatesInLayout()) {
             if (widget != nullptr) {
               widget->setBarPointerSuppressed(false);
             }
+            continue;
           }
-        };
-        if (!hasCapsuleContent) {
-          shell->setSize(iw, ih);
-          if (run.accordionClip != nullptr) {
-            run.accordionClip->setPosition(0.0F, 0.0F);
-            run.accordionClip->setSize(iw, ih);
-          }
-          content->setPosition(0.0F, 0.0F);
-          bg->setVisible(false);
-          bg->setPosition(0.0F, 0.0F);
-          bg->setSize(iw, ih);
-          placeCapsuleHoverBoxes(run, isVertical, iw, ih, 0.0F, 0.0F, std::min(iw, ih) * 0.5F, widgetHoverPadding);
-          // No pill to hover: the group renders full-size, so nothing may stay input-suppressed.
-          if (run.accordion) {
-            clearAccordionSuppression();
-          }
-          return;
-        }
-        const float pad = run.spec.padding * scale;
-        const float padMain = pad;
-        const float fullMain = isVertical ? ih : iw;
-        // Collapsed accordion: the shell only spans its always-visible member; the rest are clipped
-        // out and revealed as the hover progress lerps the main extent up to the full content size.
-        const bool accordionStartDir = run.accordion && run.accordionDirection == BarAccordionDirection::Start;
-        float revealMain = fullMain;
-        if (run.accordion) {
-          const Node* visibleMember = nullptr;
-          auto laidOut = [](const Widget* widget) {
-            const Node* node = widget != nullptr ? widget->outerNode() : nullptr;
-            return node != nullptr && node->visible() && node->participatesInLayout() ? node : nullptr;
-          };
-          if (run.accordionVisibleIndex < run.widgets.size()) {
-            visibleMember = laidOut(run.widgets[run.accordionVisibleIndex]);
-          }
-          if (visibleMember == nullptr) {
-            // The configured first member is hidden: anchor on the laid-out member at the pill's fixed edge.
-            for (Widget* widget : run.widgets) {
-              if (const Node* node = laidOut(widget); node != nullptr) {
-                visibleMember = node;
-                if (!accordionStartDir) {
-                  break;
-                }
-              }
-            }
-          }
-          if (visibleMember != nullptr) {
-            const float visMain = memberMainExtent(visibleMember);
-            const float progress = std::clamp(run.accordionProgress, 0.0F, 1.0F);
-            revealMain = visMain + (fullMain - visMain) * progress;
-          }
-        }
-        // Cross-size is the fixed capsuleCross, independent of per-widget content scale: scaling a widget
-        // enlarges its glyph/text inside the fixed-height pill rather than resizing the capsule (so a
-        // differently scaled member can't grow or split its capsule group). The main axis is content plus
-        // per-widget padding, so an icon-only widget reads as a near-circular pill at the default padding
-        // and widens as padding increases.
-        const float shellMain = revealMain + 2.0F * padMain;
-        const float shellCross = capsuleCross;
-        const float shellW = isVertical ? shellCross : shellMain;
-        const float shellH = isVertical ? shellMain : shellCross;
-        // Start-direction accordions pin the content's end edge, so the always-visible last member
-        // stays put while the hidden ones unfold off the pill's leading edge.
-        const float contentMain = accordionStartDir ? shellMain - padMain - fullMain : padMain;
-        const float contentX = isVertical ? (shellW - iw) * 0.5F : contentMain;
-        const float contentY = isVertical ? contentMain : (shellH - ih) * 0.5F;
-        shell->setSize(shellW, shellH);
-        bg->setVisible(true);
-        bg->setPosition(0.0F, 0.0F);
-        bg->setSize(shellW, shellH);
-        if (run.accordionClip != nullptr) {
-          // Reveal window: [padMain, padMain + revealMain] in shell coordinates, for both directions.
-          if (isVertical) {
-            run.accordionClip->setPosition(0.0F, padMain);
-            run.accordionClip->setSize(shellCross, revealMain);
+          if (run.accordionExpanded) {
+            widget->setBarPointerSuppressed(false);
           } else {
-            run.accordionClip->setPosition(padMain, 0.0F);
-            run.accordionClip->setSize(revealMain, shellCross);
-          }
-          content->setPosition(contentX - (isVertical ? 0.0F : padMain), contentY - (isVertical ? padMain : 0.0F));
-        } else {
-          content->setPosition(contentX, contentY);
-        }
-        const Widget* radiusSource = !run.widgets.empty() ? run.widgets.front() : nullptr;
-        const float capsuleRadius = radiusSource != nullptr ? radiusSource->resolvedBarCapsuleRadius(shellW, shellH)
-                                                            : std::max(0.0F, std::min(shellW, shellH) * 0.5F);
-        bg->setRadius(capsuleRadius);
-        if (run.container == nullptr) {
-          placeCapsuleHoverBoxes(
-              run, isVertical, shellW, shellH, contentX, contentY, capsuleRadius, widgetHoverPadding
-          );
-        }
-        // Members outside the reveal window are clipped out; while collapsed (or collapsing) the
-        // non-primary members are pointer-suppressed by reveal window so their hidden slots don't
-        // capture clicks. While expanded, every valid layout member stays unsuppressed so hover
-        // tracking and member interactions remain active across the reveal animation.
-        if (run.accordion) {
-          for (Widget* widget : run.widgets) {
-            const Node* node = widget != nullptr ? widget->outerNode() : nullptr;
-            if (widget == nullptr || node == nullptr || !node->visible() || !node->participatesInLayout()) {
-              if (widget != nullptr) {
-                widget->setBarPointerSuppressed(false);
-              }
-              continue;
-            }
-            if (run.accordionExpanded) {
-              widget->setBarPointerSuppressed(false);
-            } else {
-              const float memberStart = contentMain + memberMainPos(node);
-              const float memberEnd = memberStart + memberMainExtent(node);
-              widget->setBarPointerSuppressed(
-                  !(memberStart >= padMain - 0.5F && memberEnd <= padMain + revealMain + 0.5F)
-              );
-            }
+            const float memberStart = contentMain + memberMainPos(node);
+            const float memberEnd = memberStart + memberMainExtent(node);
+            widget->setBarPointerSuppressed(
+                !(memberStart >= padMain - 0.5F && memberEnd <= padMain + revealMain + 0.5F)
+            );
           }
         }
+      }
     };
     // Post-order: nested inner capsules are finalized (sized) before the outer capsule lays out
     // its container around them.
     auto finalizeCapsules = [&](std::vector<BarCapsuleRun>& runs) {
-      forEachCapsuleRunPostOrder(runs, finalizeOneRun);
+      for (auto& run : runs) {
+        const float childCross = std::max(1.0F, capsuleCross - 2.0F * Style::barNestedCapsuleInset * run.contentScale);
+        for (auto& child : run.children) {
+          finalizeOneRun(child, childCross);
+        }
+        finalizeOneRun(run, capsuleCross);
+      }
     };
     finalizeCapsules(instance.startCapsuleRuns);
     finalizeCapsules(instance.centerCapsuleRuns);
@@ -1394,58 +1382,59 @@ namespace {
       placeGhostPills(instance.endWidgets);
 
       auto placeOneGroupHoverPills = [&](BarCapsuleRun& run) {
-          if (run.container == nullptr || run.shell == nullptr) {
-            return;
+        if (run.container == nullptr || run.shell == nullptr) {
+          return;
+        }
+        float shellX = 0.0F;
+        float shellY = 0.0F;
+        Node::absolutePosition(run.shell, shellX, shellY);
+        shellX -= underlayX;
+        shellY -= underlayY;
+        const float shellMainStart = isVertical ? shellY : shellX;
+        const float shellCross = isVertical ? run.shell->width() : run.shell->height();
+        const Widget* radiusSource = !run.widgets.empty() ? run.widgets.front() : nullptr;
+        for (Widget* widget : run.widgets) {
+          Node* root = widget != nullptr ? widget->outerNode() : nullptr;
+          Box* box = widget != nullptr ? widget->barHoverBox() : nullptr;
+          if (box != nullptr
+              && (root == nullptr || !root->visible() || !root->participatesInLayout() || !root->hitTestVisible())) {
+            box->setSize(0.0F, 0.0F);
           }
-          float shellX = 0.0F;
-          float shellY = 0.0F;
-          Node::absolutePosition(run.shell, shellX, shellY);
-          shellX -= underlayX;
-          shellY -= underlayY;
-          const float shellMainStart = isVertical ? shellY : shellX;
-          const Widget* radiusSource = !run.widgets.empty() ? run.widgets.front() : nullptr;
-          for (Widget* widget : run.widgets) {
-            Node* root = widget != nullptr ? widget->outerNode() : nullptr;
-            Box* box = widget != nullptr ? widget->barHoverBox() : nullptr;
-            if (box != nullptr
-                && (root == nullptr || !root->visible() || !root->participatesInLayout() || !root->hitTestVisible())) {
-              box->setSize(0.0F, 0.0F);
-            }
+        }
+
+        const auto laidOut = capsuleMemberSlices(run, isVertical, instance.barConfig.widgetCapsulePadding);
+        for (const auto& member : laidOut) {
+          // Nested child shells are barriers, not hover targets: the inner capsule paints its
+          // own member pills when its own run is visited.
+          if (member.widgetIndex == kNestedChildBarrier || member.widgetIndex >= run.widgets.size()) {
+            continue;
+          }
+          Widget* widget = run.widgets[member.widgetIndex];
+          if (widget == nullptr) {
+            continue;
+          }
+          Box* box = widget->barHoverBox();
+          if (box == nullptr) {
+            continue;
           }
 
-          const auto laidOut = capsuleMemberSlices(run, isVertical, instance.barConfig.widgetCapsulePadding);
-          for (const auto& member : laidOut) {
-            // Nested child shells are barriers, not hover targets: the inner capsule paints its
-            // own member pills when its own run is visited.
-            if (member.widgetIndex == kNestedChildBarrier || member.widgetIndex >= run.widgets.size()) {
-              continue;
-            }
-            Widget* widget = run.widgets[member.widgetIndex];
-            if (widget == nullptr) {
-              continue;
-            }
-            Box* box = widget->barHoverBox();
-            if (box == nullptr) {
-              continue;
-            }
-
-            const float rootX = shellX + member.x;
-            const float rootY = shellY + member.y;
-            const float mainStart = shellMainStart + member.sliceStart;
-            const float mainEnd = shellMainStart + member.sliceEnd;
-            const float mainExtent = std::max(0.0F, mainEnd - mainStart);
-            const float hoverW = isVertical ? capsuleCross : mainExtent;
-            const float hoverH = isVertical ? mainExtent : capsuleCross;
-            box->setPosition(
-                isVertical ? rootX + (member.width - capsuleCross) * 0.5F : mainStart,
-                isVertical ? mainStart : rootY + (member.height - capsuleCross) * 0.5F
-            );
-            box->setSize(hoverW, hoverH);
-            box->setRadius(
-                radiusSource != nullptr ? radiusSource->resolvedBarCapsuleRadius(hoverW, hoverH)
-                                        : widget->resolvedBarCapsuleRadius(hoverW, hoverH)
-            );
-          }
+          const float rootX = shellX + member.x;
+          const float rootY = shellY + member.y;
+          const float mainStart = shellMainStart + member.sliceStart;
+          const float mainEnd = shellMainStart + member.sliceEnd;
+          const float mainExtent = std::max(0.0F, mainEnd - mainStart);
+          const float hoverW = isVertical ? shellCross : mainExtent;
+          const float hoverH = isVertical ? mainExtent : shellCross;
+          box->setPosition(
+              isVertical ? rootX + (member.width - shellCross) * 0.5F : mainStart,
+              isVertical ? mainStart : rootY + (member.height - shellCross) * 0.5F
+          );
+          box->setSize(hoverW, hoverH);
+          box->setRadius(
+              radiusSource != nullptr ? radiusSource->resolvedBarCapsuleRadius(hoverW, hoverH)
+                                      : widget->resolvedBarCapsuleRadius(hoverW, hoverH)
+          );
+        }
       };
       auto placeGroupHoverPills = [&](std::vector<BarCapsuleRun>& runs) {
         forEachCapsuleRunPostOrder(runs, placeOneGroupHoverPills);
@@ -2628,7 +2617,7 @@ void Bar::populateWidgets(BarInstance& instance) {
   // One level of visual nesting is supported: a member entry that is itself a `group:<id>` token
   // expands that inner group's widgets with the inner style; the scene builder nests the inner
   // capsule inside the outer one. Deeper nesting, self-references and disabled/missing inner
-  // groups are skipped with a warning. Accordion is forced off for groups involved in nesting.
+  // groups are skipped with a warning. Only groups containing nested groups lose accordion.
   auto createWidgets = [&](const std::vector<std::string>& names, std::vector<std::unique_ptr<Widget>>& dest) {
     for (const auto& name : names) {
       if (!isCapsuleGroupToken(name)) {
@@ -2660,7 +2649,7 @@ void Bar::populateWidgets(BarInstance& instance) {
         const std::string innerId = capsuleGroupTokenId(member);
         if (innerId.empty() || innerId == group->id) {
           kLog.warn(
-              "bar.{}: capsule_group \"{}\" has invalid nested reference \"{}\"; skipped", instance.barConfig.name,
+              R"(bar.{}: capsule_group "{}" has invalid nested reference "{}"; skipped)", instance.barConfig.name,
               group->id, member
           );
           continue;
@@ -2668,8 +2657,8 @@ void Bar::populateWidgets(BarInstance& instance) {
         const BarCapsuleGroupStyle* inner = findBarCapsuleGroupStyle(instance.barConfig, innerId);
         if (inner == nullptr) {
           kLog.warn(
-              "bar.{}: capsule_group \"{}\": nested entry \"{}\" has no matching capsule_group",
-              instance.barConfig.name, group->id, member
+              R"(bar.{}: capsule_group "{}": nested entry "{}" has no matching capsule_group)", instance.barConfig.name,
+              group->id, member
           );
           continue;
         }
@@ -2690,7 +2679,7 @@ void Bar::populateWidgets(BarInstance& instance) {
         for (const auto& innerMember : inner->members) {
           if (isCapsuleGroupToken(innerMember)) {
             kLog.warn(
-                "bar.{}: capsule_group \"{}\" is nested and its entry \"{}\" would nest deeper than one level; skipped",
+                R"(bar.{}: capsule_group "{}" is nested and its entry "{}" would nest deeper than one level; skipped)",
                 instance.barConfig.name, inner->id, innerMember
             );
             continue;
@@ -2914,7 +2903,7 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
     // shell to `attachParent` (the lane section for top-level runs, an outer run's container for
     // nested inner groups), recording the run in `outRuns`. Exactly one run is appended for a
     // non-empty span: a shared group shell for 2+ members, a single-capsule shell for one.
-    // Nested inner spans always arrive with accordion already forced off at populate time.
+    // Nested inner spans retain their own accordion settings.
     auto buildFlatRun = [&](std::size_t s, std::size_t e, Flex* attachParent, std::vector<BarCapsuleRun>& outRuns) {
       if (s >= e || s >= widgets.size() || attachParent == nullptr) {
         return;
@@ -2936,7 +2925,7 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
             .fill = scaleAlpha(cap.fill, cap.opacity),
             .configure = [&cap, scale](Box& bg) {
               if (cap.border.has_value()) {
-                bg.setBorder(*cap.border, Style::borderWidth * scale);
+                bg.setBorder(*cap.border, cap.borderWidth * scale);
               } else {
                 bg.clearBorder();
               }
@@ -3073,7 +3062,7 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
     // Builds a nested outer capsule run from widgets[s, e): direct members of `outerStyle` plus the
     // contiguous inner-group spans (widgets whose parentGroup is the outer id) between them. Each
     // inner span becomes a child run whose shell is a flex item of the outer container, producing a
-    // true pill-in-pill render. Accordion is always off for nested runs (forced off at populate).
+    // pill-in-pill render. The outer run stays expanded; inner runs may accordion.
     auto buildNestedOuterRun = [&](std::size_t s, std::size_t e, const BarCapsuleGroupStyle& outerStyle) {
       WidgetBarCapsuleSpec outerCap = capsuleSpecFromGroup(instance.barConfig, outerStyle);
       outerCap.accordion = false;
@@ -3102,7 +3091,7 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
           .fill = scaleAlpha(outerCap.fill, outerCap.opacity),
           .configure = [&outerCap, scale](Box& bg) {
             if (outerCap.border.has_value()) {
-              bg.setBorder(*outerCap.border, Style::borderWidth * scale);
+              bg.setBorder(*outerCap.border, outerCap.borderWidth * scale);
             } else {
               bg.clearBorder();
             }

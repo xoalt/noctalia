@@ -463,9 +463,8 @@ std::vector<std::string> nestedCapsuleGroupIds(const BarCapsuleGroupStyle& group
   return out;
 }
 
-std::set<std::string> transitiveCapsuleGroupRefs(
-    const std::set<std::string>& referenced, const std::vector<BarCapsuleGroupStyle>& groups
-) {
+std::set<std::string>
+transitiveCapsuleGroupRefs(const std::set<std::string>& referenced, const std::vector<BarCapsuleGroupStyle>& groups) {
   std::set<std::string> out = referenced;
   std::vector<std::string> queue(out.begin(), out.end());
   while (!queue.empty()) {
@@ -516,6 +515,15 @@ std::vector<BarCapsuleGroupStyle> reconcileCapsuleGroups(
     const std::vector<BarCapsuleGroupStyle>& current, const std::vector<BarCapsuleGroupStyle>& base,
     const std::set<std::string>& referenced
 ) {
+  // A lane reset can reference a parent absent from the override array. Resolve
+  // its descendants using file definitions, while preserving edited membership.
+  std::vector<BarCapsuleGroupStyle> definitions = current;
+  for (const auto& group : base) {
+    if (findGroupIn(definitions, group.id) == nullptr) {
+      definitions.push_back(group);
+    }
+  }
+  const auto reachable = transitiveCapsuleGroupRefs(referenced, definitions);
   std::vector<BarCapsuleGroupStyle> out;
   out.reserve(current.size() + base.size());
   std::vector<bool> consumed(current.size(), false);
@@ -529,12 +537,12 @@ std::vector<BarCapsuleGroupStyle> reconcileCapsuleGroups(
         break;
       }
     }
-    if (!matched && referenced.contains(baseGroup.id)) {
+    if (!matched && reachable.contains(baseGroup.id)) {
       out.push_back(baseGroup);
     }
   }
   for (std::size_t i = 0; i < current.size(); ++i) {
-    if (!consumed[i] && referenced.contains(current[i].id)) {
+    if (!consumed[i] && reachable.contains(current[i].id)) {
       out.push_back(current[i]);
     }
   }

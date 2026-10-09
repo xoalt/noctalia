@@ -484,13 +484,12 @@ capsuleGroupRefsForMonitorScope(const BarConfig& bar, const BarMonitorOverride& 
 // Transitive closure of `referenced` through `groups` members: every nested group id reachable
 // from a referenced group. Followed transitively with cycle protection so validation and
 // reconcile never drop a reachable group, even though rendering expands only one level.
-[[nodiscard]] std::set<std::string> transitiveCapsuleGroupRefs(
-    const std::set<std::string>& referenced, const std::vector<BarCapsuleGroupStyle>& groups
-);
+[[nodiscard]] std::set<std::string>
+transitiveCapsuleGroupRefs(const std::set<std::string>& referenced, const std::vector<BarCapsuleGroupStyle>& groups);
 
 // Rebuilds an overriding capsule_group array against the config-file array, in file order: an
 // overridden group keeps its edited style, a file group the lanes reference again comes back, and a
-// GUI-created group survives only while a lane still references it (nothing can reach it otherwise).
+// GUI-created group survives while reachable from a lane, including through a restored parent.
 [[nodiscard]] std::vector<BarCapsuleGroupStyle> reconcileCapsuleGroups(
     const std::vector<BarCapsuleGroupStyle>& current, const std::vector<BarCapsuleGroupStyle>& base,
     const std::set<std::string>& referenced

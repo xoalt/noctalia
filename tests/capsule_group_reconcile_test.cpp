@@ -1,4 +1,5 @@
 #include "config/config_types.h"
+#include "test_check.h"
 
 #include <print>
 #include <set>
@@ -163,11 +164,33 @@ int main() {
          )
         && ok;
     // ...and drops it once nothing reaches it anymore.
-    ok = expect(
-             reconcileCapsuleGroups(current, {}, std::set<std::string>{}).empty(),
-             "unreferenced nested group is dropped"
-         )
+    ok =
+        expect(
+            reconcileCapsuleGroups(current, {}, std::set<std::string>{}).empty(), "unreferenced nested group is dropped"
+        )
         && ok;
+  }
+
+  // Resetting a lane must restore the whole file-defined subtree, even when its
+  // parent is absent from the current override array and the child precedes it.
+  {
+    const auto outer = group("outer", {"clock", "group:inner"});
+    const auto inner = group("inner", {"network", "volume"});
+    const std::vector<BarCapsuleGroupStyle> nestedBase{inner, outer};
+    TEST_CHECK(reconcileCapsuleGroups({}, nestedBase, {"outer"}) == nestedBase);
+
+    // A retained override owns membership; do not revive children removed there.
+    const auto editedOuter = group("outer", {"clock"});
+    TEST_CHECK(
+        reconcileCapsuleGroups({editedOuter}, nestedBase, {"outer"}) == std::vector<BarCapsuleGroupStyle>{editedOuter}
+    );
+
+    // A restored parent may also reference a GUI-created child with edited style.
+    const auto editedInner = group("inner", {"network", "volume"}, 12.0F);
+    TEST_CHECK(
+        reconcileCapsuleGroups({editedInner}, {outer}, {"outer"})
+        == (std::vector<BarCapsuleGroupStyle>{outer, editedInner})
+    );
   }
 
   return ok ? 0 : 1;

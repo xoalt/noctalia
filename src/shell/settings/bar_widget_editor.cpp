@@ -49,6 +49,27 @@ namespace settings {
 
   namespace {
 
+    struct GroupPreviewColors {
+      ColorSpec fill;
+      ColorSpec border;
+    };
+
+    GroupPreviewColors groupPreviewColors(const ColorSpec& fill, bool nested = false) {
+      const Color resolved = resolveColorSpec(fill);
+      const Color lane = colorForRole(ColorRole::SurfaceVariant);
+      const float dr = resolved.r - lane.r;
+      const float dg = resolved.g - lane.g;
+      const float db = resolved.b - lane.b;
+      const bool distinct = dr * dr + dg * dg + db * db >= 0.15F * 0.15F;
+      GroupPreviewColors colors{
+          .fill = distinct ? fill : colorSpecFromRole(ColorRole::OnSurface),
+          .border = distinct ? fill : colorSpecFromRole(ColorRole::Outline),
+      };
+      colors.fill.alpha *= distinct ? 0.10F : 0.04F;
+      colors.border.alpha *= nested ? 0.35F : 0.55F;
+      return colors;
+    }
+
     struct LaneWidgetDragState {
       bool active = false;
       bool moved = false;
@@ -750,14 +771,6 @@ namespace settings {
         const BarCapsuleGroupStyle* movingGroup = findCapsuleGroupStyle(scopeGroups, movingId);
         bool nestingOk = movingGroup != nullptr && movingId != dstId && !capsuleGroupHasNestedRef(*movingGroup);
         if (nestingOk) {
-          for (const auto& nested : nestedCapsuleGroupIds(*movingGroup)) {
-            if (nested == dstId) {
-              nestingOk = false; // cycle: the destination is already nested inside the moving group
-              break;
-            }
-          }
-        }
-        if (nestingOk) {
           for (const auto& g : scopeGroups) {
             if (g.id != dstId && std::ranges::contains(nestedCapsuleGroupIds(g), dstId)) {
               nestingOk = false; // the destination is itself nested: the move would nest two levels deep
@@ -824,19 +837,8 @@ namespace settings {
         applyZone(dstZone, dstItems);
       }
 
-      // Nesting a group disables accordion on both groups (the runtime always renders nested
-      // groups expanded); the style editors then show the effective state. Fills are left exactly
-      // as configured: identical fills blend into one flat-looking pill, distinct fills read as
-      // pill-in-pill - restyle in the style editor to taste.
-      if (zones[dstZone].isGroup && isCapsuleGroupToken(moving)) {
-        const std::string dstId = zones[dstZone].groupId;
-        const std::string movingId = capsuleGroupTokenId(moving);
-        for (auto& g : groups) {
-          if (g.id == dstId || g.id == movingId) {
-            g.accordion = false;
-          }
-        }
-      }
+      // Keep stored accordion preferences. The renderer and inspector suppress
+      // the outer group's accordion while it contains a nested group.
 
       // Dragging the last member out empties a group: drop it, its lane token, and any nested
       // references to it. Scrubbing a nested reference can empty another group, so repeat to a
@@ -2495,43 +2497,12 @@ namespace settings {
               .paddingH = Style::spaceSm * ctx.scale,
               .radius = Style::scaledRadiusSm(ctx.scale),
               .onClick = [&selectedLaneWidgets = ctx.selectedLaneWidgets, setOverrides = ctx.setOverrides, groupId,
-                          groupPath, laneListPath, config = &ctx.config, closeHostedEditor = ctx.closeHostedEditor]() {
-                std::vector<BarCapsuleGroupStyle> currentGroups = capsuleGroupsForLanePath(*config, laneListPath);
-                const BarCapsuleGroupStyle* g = findCapsuleGroupStyle(currentGroups, groupId);
-                if (g == nullptr) {
-                  if (closeHostedEditor) {
-                    closeHostedEditor();
-                  }
-                  return;
+                          laneListPath, config = &ctx.config, closeHostedEditor = ctx.closeHostedEditor]() {
+                auto edits = capsuleGroupUngroupEdits(*config, laneListPath, groupId);
+                if (!edits.empty()) {
+                  selectedLaneWidgets.clear();
+                  setOverrides(std::move(edits));
                 }
-                if (groupPath.empty()) {
-                  return;
-                }
-                const std::vector<std::string> members = g->members;
-                std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>> batch;
-                // Replace the group token with its members in whichever lane holds it.
-                const std::string token = makeCapsuleGroupToken(groupId);
-                for (const auto laneKey : {"start", "center", "end"}) {
-                  std::vector<std::string> lanePath = pathWithLastSegment(laneListPath, laneKey);
-                  std::vector<std::string> lane = barWidgetItemsForPath(*config, lanePath);
-                  const auto it = std::ranges::find(lane, token);
-                  if (it == lane.end()) {
-                    continue;
-                  }
-                  const std::size_t pos = static_cast<std::size_t>(it - lane.begin());
-                  lane.erase(lane.begin() + static_cast<std::ptrdiff_t>(pos));
-                  lane.insert(lane.begin() + static_cast<std::ptrdiff_t>(pos), members.begin(), members.end());
-                  batch.emplace_back(lanePath, lane);
-                }
-                std::vector<BarCapsuleGroupStyle> remaining;
-                for (const auto& gx : currentGroups) {
-                  if (gx.id != groupId) {
-                    remaining.push_back(gx);
-                  }
-                }
-                batch.emplace_back(groupPath, remaining);
-                selectedLaneWidgets.clear();
-                setOverrides(std::move(batch));
                 if (closeHostedEditor) {
                   closeHostedEditor();
                 }
@@ -2676,6 +2647,50 @@ namespace settings {
     }
 
   } // namespace
+
+  std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>>
+  capsuleGroupUngroupEdits(const Config& config, const std::vector<std::string>& lanePath, std::string_view groupId) {
+    const auto groupPath = capsuleGroupPathForLanePath(lanePath);
+    if (groupPath.empty()) {
+      return {};
+    }
+    auto groups = capsuleGroupsForLanePath(config, lanePath);
+    const auto* group = findCapsuleGroupStyle(groups, groupId);
+    if (group == nullptr) {
+      return {};
+    }
+    const auto members = group->members;
+    const auto token = makeCapsuleGroupToken(groupId);
+    const auto expand = [&](std::vector<std::string>& entries) {
+      if (!std::ranges::contains(entries, token)) {
+        return false;
+      }
+      std::vector<std::string> expanded;
+      for (const auto& entry : entries) {
+        if (entry == token) {
+          expanded.insert(expanded.end(), members.begin(), members.end());
+        } else {
+          expanded.push_back(entry);
+        }
+      }
+      entries = std::move(expanded);
+      return true;
+    };
+    std::vector<std::pair<std::vector<std::string>, ConfigOverrideValue>> edits;
+    for (const auto* laneKey : {"start", "center", "end"}) {
+      auto path = pathWithLastSegment(lanePath, laneKey);
+      auto entries = barWidgetItemsForPath(config, path);
+      if (expand(entries)) {
+        edits.emplace_back(std::move(path), std::move(entries));
+      }
+    }
+    std::erase_if(groups, [&](const auto& candidate) { return candidate.id == groupId; });
+    for (auto& parent : groups) {
+      expand(parent.members);
+    }
+    edits.emplace_back(groupPath, std::move(groups));
+    return edits;
+  }
 
   bool isBarWidgetListPath(const std::vector<std::string>& path) {
     if (path.size() < 3 || path.front() != "bar") {
@@ -3239,32 +3254,14 @@ namespace settings {
             continue;
           }
 
-          // Tint the container by the group's own fill so groups with different colors are distinguishable.
-          // A color meant to blend into surfaces (e.g. surface_variant) can't separate the box from the lane,
-          // so fall back to a neutral border + slight surface lift when the fill is too close to the lane.
-          const Color groupFillColor = resolveColorSpec(group->fill);
-          const Color laneBgColor = colorForRole(ColorRole::SurfaceVariant);
-          const float dr = groupFillColor.r - laneBgColor.r;
-          const float dg = groupFillColor.g - laneBgColor.g;
-          const float db = groupFillColor.b - laneBgColor.b;
-          const bool fillDistinct = std::sqrt(dr * dr + dg * dg + db * db) >= 0.15F;
-          ColorSpec groupFillTint;
-          ColorSpec groupBorder;
-          if (fillDistinct) {
-            groupFillTint = group->fill;
-            groupFillTint.alpha *= 0.15F;
-            groupBorder = group->fill; // full opacity
-          } else {
-            groupFillTint = colorSpecFromRole(ColorRole::OnSurface, 0.06F); // slight neutral lift
-            groupBorder = colorSpecFromRole(ColorRole::Outline);            // full opacity
-          }
+          const auto preview = groupPreviewColors(group->fill);
           auto container = ui::column({
               .align = FlexAlign::Stretch,
               .gap = Style::spaceXs * ctx.scale,
               .padding = Style::spaceXs * ctx.scale,
-              .fill = groupFillTint,
+              .fill = preview.fill,
               .radius = Style::scaledRadiusSm(ctx.scale),
-              .border = groupBorder,
+              .border = preview.border,
               .opacity = group->enabled ? 1.0F : 0.45F,
           });
           auto* containerPtr = container.get();
@@ -3361,34 +3358,11 @@ namespace settings {
                     .radius = Style::scaledRadiusSm(ctx.scale),
                     .onClick = [&selectedLaneWidgets = ctx.selectedLaneWidgets, config = &ctx.config, lanePath, gid,
                                 setOverrides = ctx.setOverrides]() {
-                      std::vector<BarCapsuleGroupStyle> groups = capsuleGroupsForLanePath(*config, lanePath);
-                      const BarCapsuleGroupStyle* g = findCapsuleGroupStyle(groups, gid);
-                      if (g == nullptr) {
-                        return;
+                      auto edits = capsuleGroupUngroupEdits(*config, lanePath, gid);
+                      if (!edits.empty()) {
+                        selectedLaneWidgets.clear();
+                        setOverrides(std::move(edits));
                       }
-                      const std::vector<std::string> groupPath = capsuleGroupPathForLanePath(lanePath);
-                      if (groupPath.empty()) {
-                        return;
-                      }
-                      const std::vector<std::string> members = g->members;
-                      std::vector<std::string> laneEntries = barWidgetItemsForPath(*config, lanePath);
-                      const std::string token = makeCapsuleGroupToken(gid);
-                      const auto it = std::ranges::find(laneEntries, token);
-                      if (it != laneEntries.end()) {
-                        const std::size_t pos = static_cast<std::size_t>(it - laneEntries.begin());
-                        laneEntries.erase(laneEntries.begin() + static_cast<std::ptrdiff_t>(pos));
-                        laneEntries.insert(
-                            laneEntries.begin() + static_cast<std::ptrdiff_t>(pos), members.begin(), members.end()
-                        );
-                      }
-                      std::vector<BarCapsuleGroupStyle> remaining;
-                      for (const auto& x : groups) {
-                        if (x.id != gid) {
-                          remaining.push_back(x);
-                        }
-                      }
-                      selectedLaneWidgets.clear();
-                      setOverrides({{lanePath, laneEntries}, {groupPath, remaining}});
                     },
                 })
             );
@@ -3434,32 +3408,14 @@ namespace settings {
                 : nullptr;
             if (innerGroup != nullptr) {
               const std::string innerId = innerGroup->id;
-              // Same tint language as top-level group containers, so the nested box - bottom edge
-              // included - reads distinctly instead of blending into its parent container.
-              const Color nestedFillColor = resolveColorSpec(innerGroup->fill);
-              const Color nestedLaneBg = colorForRole(ColorRole::SurfaceVariant);
-              const float nestedDr = nestedFillColor.r - nestedLaneBg.r;
-              const float nestedDg = nestedFillColor.g - nestedLaneBg.g;
-              const float nestedDb = nestedFillColor.b - nestedLaneBg.b;
-              const bool nestedDistinct =
-                  std::sqrt(nestedDr * nestedDr + nestedDg * nestedDg + nestedDb * nestedDb) >= 0.15F;
-              ColorSpec nestedFillTint;
-              ColorSpec nestedBorder;
-              if (nestedDistinct) {
-                nestedFillTint = innerGroup->fill;
-                nestedFillTint.alpha *= 0.15F;
-                nestedBorder = innerGroup->fill; // full opacity
-              } else {
-                nestedFillTint = colorSpecFromRole(ColorRole::OnSurface, 0.06F); // slight neutral lift
-                nestedBorder = colorSpecFromRole(ColorRole::Outline);             // full opacity
-              }
+              const auto nestedPreview = groupPreviewColors(innerGroup->fill, true);
               auto nested = ui::column({
                   .align = FlexAlign::Stretch,
                   .gap = Style::spaceXs * ctx.scale,
                   .padding = Style::spaceXs * ctx.scale,
-                  .fill = nestedFillTint,
+                  .fill = nestedPreview.fill,
                   .radius = Style::scaledRadiusSm(ctx.scale),
-                  .border = nestedBorder,
+                  .border = nestedPreview.border,
                   .opacity = innerGroup->enabled ? 1.0F : 0.45F,
               });
               auto* nestedPtr = nested.get();
@@ -3534,8 +3490,8 @@ namespace settings {
                       .minHeight = iconSize,
                       .padding = iconPad,
                       .radius = Style::scaledRadiusSm(ctx.scale),
-                      .onClick = [openCapsuleGroupInspector = ctx.openCapsuleGroupInspector,
-                                  laneListPath = entry.path, innerId]() {
+                      .onClick = [openCapsuleGroupInspector = ctx.openCapsuleGroupInspector, laneListPath = entry.path,
+                                  innerId]() {
                         if (openCapsuleGroupInspector) {
                           openCapsuleGroupInspector(laneListPath, innerId);
                         }
