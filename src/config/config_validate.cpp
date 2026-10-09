@@ -717,13 +717,19 @@ namespace noctalia::config {
             if (capsuleGroupTokenId(innerMember) == group.id) {
               diag.warn(
                   path,
-                  "capsule_group \"" + group.id + "\" and \"" + inner->id
+                  "capsule_group \""
+                      + group.id
+                      + "\" and \""
+                      + inner->id
                       + "\" nest inside each other; the inner reference is skipped"
               );
             } else {
               diag.warn(
                   path,
-                  "capsule_group \"" + inner->id + "\" is nested and its entry \"" + innerMember
+                  "capsule_group \""
+                      + inner->id
+                      + "\" is nested and its entry \""
+                      + innerMember
                       + "\" would nest deeper than one level; it is skipped"
               );
             }
@@ -731,14 +737,14 @@ namespace noctalia::config {
           if (group.accordion) {
             diag.warn(
                 path,
-                "capsule_group \"" + group.id + "\" nests \"" + inner->id
+                "capsule_group \""
+                    + group.id
+                    + "\" nests \""
+                    + inner->id
                     + "\"; accordion is disabled for groups containing nested groups"
             );
           } else if (inner->accordion && capsuleGroupHasNestedRef(*inner)) {
-            diag.warn(
-                path,
-                "capsule_group \"" + inner->id + "\" nests further groups; accordion is disabled for it"
-            );
+            diag.warn(path, "capsule_group \"" + inner->id + "\" nests further groups; accordion is disabled for it");
           }
         }
       }
